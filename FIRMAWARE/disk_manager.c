@@ -18,56 +18,205 @@
 #define FA_OPEN_APPEND  0x30
 #endif
 
+// FatFS file attribute definitions
+#ifndef AM_RDO
+#define AM_RDO  0x01    // Read only
+#define AM_HID  0x02    // Hidden
+#define AM_SYS  0x04    // System
+#define AM_VOL  0x08    // Volume label
+#define AM_LFN  0x0F    // Long file name
+#define AM_DIR  0x10    // Directory
+#define AM_ARC  0x20    // Archive
+#define AM_MASK 0x3F    // Mask of defined bits
+#endif
+
 void disk_manager_init(disk_manager_t *dm) {
     memset(dm, 0, sizeof(disk_manager_t));
     dm->current_index = 0;
     dm->disk_loaded = false;
+    strncpy(dm->current_path, "", MAX_PATH_LEN - 1);
+    dm->current_path[MAX_PATH_LEN - 1] = '\0';
 }
 
+// Стандартно сканиране (само корнева директория)
 bool disk_manager_scan(disk_manager_t *dm) {
     FRESULT res;
     DIR dir;
     FILINFO fno;
     uint8_t count = 0;
+    uint8_t total_files = 0;
     
-    // Отваряне на директория
+    printf("Сканиране за .dsk файлове (само корнева директория)...\n");
+    
+    // Проверка дали файловата система е монтирана
+    // (няма директен начин да проверим, но опитът за отваряне на директория ще покаже)
+    
+#if FF_USE_FIND
+    // Използване на f_findfirst/f_findnext за по-надеждно търсене
+    res = f_findfirst(&dir, &fno, "", "*.DSK");
+    if (res == FR_OK) {
+        // Търсене на .DSK файлове (главни букви)
+        while (count < MAX_DISK_IMAGES && fno.fname[0] != 0) {
+            if (!(fno.fattrib & AM_DIR) && !(fno.fattrib & AM_HID)) {
+                strncpy(dm->images[count].filename, fno.fname, MAX_FILENAME_LEN - 1);
+                dm->images[count].filename[MAX_FILENAME_LEN - 1] = '\0';
+                dm->images[count].file_size = fno.fsize;
+                dm->images[count].format = DISK_FORMAT_AUTO;
+                dm->images[count].loaded = false;
+                printf("Намерен .DSK файл: %s (размер: %lu байта)\n", 
+                       dm->images[count].filename, 
+                       (unsigned long)dm->images[count].file_size);
+                count++;
+            }
+            res = f_findnext(&dir, &fno);
+            if (res != FR_OK) break;
+        }
+        f_closedir(&dir);
+    }
+    
+    // Търсене на .dsk файлове (малки букви)
+    res = f_findfirst(&dir, &fno, "", "*.dsk");
+    if (res == FR_OK) {
+        while (count < MAX_DISK_IMAGES && fno.fname[0] != 0) {
+            if (!(fno.fattrib & AM_DIR) && !(fno.fattrib & AM_HID)) {
+                strncpy(dm->images[count].filename, fno.fname, MAX_FILENAME_LEN - 1);
+                dm->images[count].filename[MAX_FILENAME_LEN - 1] = '\0';
+                dm->images[count].file_size = fno.fsize;
+                dm->images[count].format = DISK_FORMAT_AUTO;
+                dm->images[count].loaded = false;
+                printf("Намерен .dsk файл: %s (размер: %lu байта)\n", 
+                       dm->images[count].filename, 
+                       (unsigned long)dm->images[count].file_size);
+                count++;
+            }
+            res = f_findnext(&dir, &fno);
+            if (res != FR_OK) break;
+        }
+        f_closedir(&dir);
+    }
+#endif
+    
+    // Fallback: Стандартно сканиране на директорията
     res = f_opendir(&dir, "");
     if (res != FR_OK) {
+        printf("ГРЕШКА: Не може да се отвори директория (код: %d)\n", res);
+        switch (res) {
+            case FR_DISK_ERR:
+                printf("  -> Грешка при достъп до диска\n");
+                break;
+            case FR_INT_ERR:
+                printf("  -> Вътрешна грешка на файловата система\n");
+                break;
+            case FR_NOT_READY:
+                printf("  -> Дискът не е готов\n");
+                break;
+            case FR_NO_FILESYSTEM:
+                printf("  -> Няма валидна FAT файлова система\n");
+                break;
+            default:
+                printf("  -> Непозната грешка\n");
+                break;
+        }
+        if (count > 0) {
+            dm->count = count;
+            printf("Намерени са %d файла преди грешката\n", count);
+            return true;
+        }
         return false;
     }
     
     // Търсене на .dsk файлове
     while (count < MAX_DISK_IMAGES) {
         res = f_readdir(&dir, &fno);
-        if (res != FR_OK || fno.fname[0] == 0) {
+        if (res != FR_OK) {
+            // FR_NO_FILE (4) може да означава край на директорията при някои версии на FatFS
+            if (res == FR_NO_FILE) {
+                printf("Край на директорията (FR_NO_FILE)\n");
+                break;
+            }
+            printf("ГРЕШКА при четене на директория (код: %d)\n", res);
+            // При други грешки продължаваме, но с предупреждение
+            if (res != FR_DISK_ERR && res != FR_INT_ERR) {
+                break;
+            }
+            // При критични грешки спираме
+            printf("Критична грешка, спиране на сканирането\n");
             break;
+        }
+        
+        // Край на директорията (нормален случай)
+        if (fno.fname[0] == 0) {
+            printf("Край на директорията (празно име)\n");
+            break;
+        }
+        
+        total_files++;
+        
+        // Пропускане на директории и скрити файлове
+        if (fno.fattrib & AM_DIR) {
+            printf("Пропусната директория: %s\n", fno.fname);
+            continue;
+        }
+        
+        // Пропускане на скрити файлове
+        if (fno.fattrib & AM_HID) {
+            printf("Пропуснат скрит файл: %s\n", fno.fname);
+            continue;
         }
         
         // Проверка за .dsk разширение (case-insensitive)
         size_t len = strlen(fno.fname);
-        if (len >= 4) {
-            const char *ext = fno.fname + len - 4;
-            // Проста case-insensitive проверка
-            bool is_dsk = (ext[0] == '.' && 
-                          (ext[1] == 'd' || ext[1] == 'D') &&
-                          (ext[2] == 's' || ext[2] == 'S') &&
-                          (ext[3] == 'k' || ext[3] == 'K'));
+        if (len < 4) {
+            printf("Пропуснат файл (твърде кратко име): %s\n", fno.fname);
+            continue;
+        }
+        
+        const char *ext = fno.fname + len - 4;
+        // Проста case-insensitive проверка
+        bool is_dsk = (ext[0] == '.' && 
+                      (ext[1] == 'd' || ext[1] == 'D') &&
+                      (ext[2] == 's' || ext[2] == 'S') &&
+                      (ext[3] == 'k' || ext[3] == 'K'));
+        
+        if (is_dsk) {
+            // Проверка дали файлът вече не е добавен (от f_findfirst)
+            bool already_added = false;
+            for (uint8_t i = 0; i < count; i++) {
+                if (strcmp(dm->images[i].filename, fno.fname) == 0) {
+                    already_added = true;
+                    break;
+                }
+            }
             
-            if (is_dsk) {
+            if (!already_added) {
                 strncpy(dm->images[count].filename, fno.fname, MAX_FILENAME_LEN - 1);
                 dm->images[count].filename[MAX_FILENAME_LEN - 1] = '\0';
                 dm->images[count].file_size = fno.fsize;
                 dm->images[count].format = DISK_FORMAT_AUTO;  // Ще се определи автоматично
                 dm->images[count].loaded = false;
+                printf("Намерен .dsk файл: %s (размер: %lu байта)\n", 
+                       dm->images[count].filename, 
+                       (unsigned long)dm->images[count].file_size);
                 count++;
             }
+        } else {
+            printf("Пропуснат файл (не е .dsk): %s\n", fno.fname);
         }
     }
     
     f_closedir(&dir);
     dm->count = count;
     
+    printf("Общо файлове в директорията: %d\n", total_files);
     printf("Намерени %d дискови имиджа\n", count);
+    
+    if (count == 0 && total_files > 0) {
+        printf("ПРЕДУПРЕЖДЕНИЕ: Намерени са файлове, но никой не е .dsk файл!\n");
+        printf("Моля, проверете че файловете имат разширение .dsk (малки или главни букви)\n");
+    } else if (count == 0 && total_files == 0) {
+        printf("ПРЕДУПРЕЖДЕНИЕ: Директорията е празна или не може да се прочете!\n");
+    }
+    
     return count > 0;
 }
 
@@ -178,5 +327,158 @@ disk_image_t* disk_manager_get_disk(disk_manager_t *dm, uint8_t index) {
 
 uint8_t disk_manager_get_current_index(disk_manager_t *dm) {
     return dm->current_index;
+}
+
+// Рекурсивно сканиране на директории за .dsk файлове
+static void scan_directory_recursive(disk_manager_t *dm, const char *path, uint8_t *count) {
+    FRESULT res;
+    DIR dir;
+    FILINFO fno;
+    char full_path[MAX_PATH_LEN];
+    char sub_path[MAX_PATH_LEN];
+    
+    // Отваряне на директорията
+    res = f_opendir(&dir, path);
+    if (res != FR_OK) {
+        return;
+    }
+    
+    // Четене на всички елементи в директорията
+    while (*count < MAX_DISK_IMAGES) {
+        res = f_readdir(&dir, &fno);
+        if (res != FR_OK || fno.fname[0] == 0) {
+            break;
+        }
+        
+        // Пропускане на скрити файлове и системни файлове
+        if (fno.fattrib & (AM_HID | AM_SYS | AM_VOL)) {
+            continue;
+        }
+        
+        // Конструиране на пълен път
+        if (strlen(path) == 0) {
+            snprintf(full_path, MAX_PATH_LEN, "%s", fno.fname);
+        } else {
+            snprintf(full_path, MAX_PATH_LEN, "%s/%s", path, fno.fname);
+        }
+        
+        // Проверка дали е директория
+        if (fno.fattrib & AM_DIR) {
+            // Рекурсивно сканиране на поддиректорията
+            scan_directory_recursive(dm, full_path, count);
+        } else {
+            // Проверка за .dsk разширение
+            size_t len = strlen(fno.fname);
+            if (len >= 4) {
+                const char *ext = fno.fname + len - 4;
+                bool is_dsk = (ext[0] == '.' && 
+                              (ext[1] == 'd' || ext[1] == 'D') &&
+                              (ext[2] == 's' || ext[2] == 'S') &&
+                              (ext[3] == 'k' || ext[3] == 'K'));
+                
+                if (is_dsk) {
+                    strncpy(dm->images[*count].filename, full_path, MAX_FILENAME_LEN - 1);
+                    dm->images[*count].filename[MAX_FILENAME_LEN - 1] = '\0';
+                    dm->images[*count].file_size = fno.fsize;
+                    dm->images[*count].format = DISK_FORMAT_AUTO;
+                    dm->images[*count].loaded = false;
+                    printf("Намерен .dsk файл: %s (размер: %lu байта)\n", 
+                           full_path, (unsigned long)fno.fsize);
+                    (*count)++;
+                }
+            }
+        }
+    }
+    
+    f_closedir(&dir);
+}
+
+// Рекурсивно сканиране на всички поддиректории
+bool disk_manager_scan_recursive(disk_manager_t *dm, const char *path) {
+    uint8_t count = 0;
+    
+    printf("Рекурсивно сканиране за .dsk файлове в: %s\n", path ? path : "root");
+    
+    scan_directory_recursive(dm, path ? path : "", &count);
+    
+    dm->count = count;
+    printf("Намерени %d дискови имиджа (рекурсивно)\n", count);
+    
+    return count > 0;
+}
+
+// Получаване на текущия път
+const char* disk_manager_get_current_path(disk_manager_t *dm) {
+    return dm->current_path;
+}
+
+// Задаване на текущ път
+bool disk_manager_set_path(disk_manager_t *dm, const char *path) {
+    if (path == NULL) {
+        dm->current_path[0] = '\0';
+        return true;
+    }
+    
+    if (strlen(path) >= MAX_PATH_LEN) {
+        return false;
+    }
+    
+    strncpy(dm->current_path, path, MAX_PATH_LEN - 1);
+    dm->current_path[MAX_PATH_LEN - 1] = '\0';
+    return true;
+}
+
+// Списък на елементите в директория (файлове и поддиректории)
+bool disk_manager_list_directory(disk_manager_t *dm, const char *path, 
+                                  char items[][MAX_FILENAME_LEN], 
+                                  bool is_dir[], 
+                                  uint8_t *count, 
+                                  uint8_t max_items) {
+    FRESULT res;
+    DIR dir;
+    FILINFO fno;
+    uint8_t item_count = 0;
+    
+    // Добавяне на опция за връщане назад (ако не сме в корневата директория)
+    if (path != NULL && strlen(path) > 0) {
+        strncpy(items[item_count], "..", MAX_FILENAME_LEN - 1);
+        items[item_count][MAX_FILENAME_LEN - 1] = '\0';
+        is_dir[item_count] = true;
+        item_count++;
+    }
+    
+    // Отваряне на директорията
+    res = f_opendir(&dir, path ? path : "");
+    if (res != FR_OK) {
+        *count = item_count;
+        return item_count > 0;  // Връщаме true ако имаме поне ".."
+    }
+    
+    // Четене на всички елементи
+    while (item_count < max_items) {
+        res = f_readdir(&dir, &fno);
+        if (res != FR_OK || fno.fname[0] == 0) {
+            break;
+        }
+        
+        // Пропускане на скрити файлове и системни файлове
+        if (fno.fattrib & (AM_HID | AM_SYS | AM_VOL)) {
+            continue;
+        }
+        
+        // Проверка дали е директория
+        is_dir[item_count] = (fno.fattrib & AM_DIR) != 0;
+        
+        // Копиране на името
+        strncpy(items[item_count], fno.fname, MAX_FILENAME_LEN - 1);
+        items[item_count][MAX_FILENAME_LEN - 1] = '\0';
+        
+        item_count++;
+    }
+    
+    f_closedir(&dir);
+    *count = item_count;
+    
+    return true;
 }
 

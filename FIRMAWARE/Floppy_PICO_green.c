@@ -28,6 +28,17 @@
 #include "sector_detector.h"
 #include "cli.h"
 
+// FatFS file access mode definitions (ако не са дефинирани в ff.h)
+#ifndef FA_READ
+#define FA_READ         0x01
+#define FA_WRITE        0x02
+#define FA_OPEN_EXISTING 0x00
+#define FA_CREATE_NEW   0x04
+#define FA_CREATE_ALWAYS 0x08
+#define FA_OPEN_ALWAYS  0x10
+#define FA_OPEN_APPEND  0x30
+#endif
+
 // ============================================================================
 // GPIO Pin Definitions (използват се от конфигурацията)
 // ============================================================================
@@ -118,12 +129,21 @@ static uint32_t last_display_update = 0;
 // Меню режими
 typedef enum {
     UI_MODE_NORMAL = 0,      // Нормален режим (показва статус)
-    UI_MODE_DISK_SELECT = 1  // Режим за избор на диск
+    UI_MODE_DISK_SELECT = 1, // Режим за избор на диск (списък от всички .dsk файлове)
+    UI_MODE_DIR_NAV = 2     // Режим за навигация в директории
 } ui_mode_t;
 
 static ui_mode_t ui_mode = UI_MODE_NORMAL;
 static uint8_t disk_menu_selection = 0;  // Избран диск в менюто
 static uint8_t disk_menu_start = 0;      // Първия диск на текущата страница
+
+// Навигация в директории
+static char dir_items[20][MAX_FILENAME_LEN];  // Елементи в текущата директория
+static bool dir_item_is_dir[20];              // Дали елементът е директория
+static uint8_t dir_item_count = 0;             // Брой елементи
+static uint8_t dir_menu_selection = 0;          // Избран елемент
+static uint8_t dir_menu_start = 0;              // Първия елемент на страницата
+static uint32_t last_button_press = 0;         // Време на последното натискане на бутона
 
 // GCR кодиране таблица (5-битови кодове за 4-битови данни)
 static const uint8_t gcr_encode_table[16] = {
@@ -167,7 +187,16 @@ static void sd_spi_init(void) {
 // Изпращане на команда към SD карта
 static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg) {
     uint8_t response;
-    uint8_t crc = 0x95;  // За CMD0
+    uint8_t crc;
+    
+    // CRC за специфични команди
+    if (cmd == 0x40) {
+        crc = 0x95;  // CRC за CMD0
+    } else if (cmd == 0x48 && arg == 0x000001AA) {
+        crc = 0x87;  // CRC за CMD8 с аргумент 0x000001AA
+    } else {
+        crc = 0xFF;  // CRC disabled за останалите команди в SPI режим
+    }
     
     gpio_put(PIN_CS, 0);
     
@@ -185,9 +214,10 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg) {
     // Изпращане на CRC
     spi_write_blocking(SPI_PORT, &crc, 1);
     
-    // Четене на отговор
+    // Четене на отговор (до 8 байта за по-бавни карти)
     uint8_t dummy = 0xFF;
-    for (int i = 0; i < 10; i++) {
+    response = 0xFF;
+    for (int i = 0; i < 8; i++) {
         spi_read_blocking(SPI_PORT, 0xFF, &response, 1);
         if ((response & 0x80) == 0) break;
     }
@@ -201,45 +231,109 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg) {
 // Инициализация на SD карта
 bool sd_init(void) {
     uint8_t response;
-    
-    // Първоначални clock цикли
+    bool is_sdhc = false;
     uint8_t dummy = 0xFF;
-    for (int i = 0; i < 10; i++) {
+    
+    // Първоначални clock цикли (минимум 74 за SD карта)
+    for (int i = 0; i < 80; i++) {
         spi_write_blocking(SPI_PORT, &dummy, 1);
     }
     
-    // CMD0 - Reset
+    // CMD0 - Reset (GO_IDLE_STATE)
     response = sd_send_cmd(0x40, 0);
     if (response != 0x01) {
         printf("SD CMD0 failed: 0x%02X\n", response);
         return false;
     }
     
-    // CMD8 - Check voltage
-    response = sd_send_cmd(0x48, 0x000001AA);
-    if (response == 0x01) {
-        // SDHC/SDXC карта
-        uint8_t r7[4];
-        spi_read_blocking(SPI_PORT, 0xFF, r7, 4);
+    // Изчакване след CMD0
+    sleep_ms(10);
+    
+    // CMD8 - Check voltage (SEND_IF_COND)
+    // За CMD8 трябва да четем R7 отговора докато CS е ниско
+    gpio_put(PIN_CS, 0);
+    uint8_t cmd8_cmd = 0x48;
+    uint8_t cmd8_crc = 0x87;
+    uint8_t cmd8_arg[4] = {0x00, 0x00, 0x01, 0xAA};
+    
+    // Изпращане на CMD8
+    spi_write_blocking(SPI_PORT, &cmd8_cmd, 1);
+    spi_write_blocking(SPI_PORT, cmd8_arg, 4);
+    spi_write_blocking(SPI_PORT, &cmd8_crc, 1);
+    
+    // Четене на отговор
+    response = 0xFF;
+    for (int i = 0; i < 8; i++) {
+        spi_read_blocking(SPI_PORT, 0xFF, &response, 1);
+        if ((response & 0x80) == 0) break;
     }
     
-    // ACMD41 - Initialize
-    for (int i = 0; i < 100; i++) {
-        sd_send_cmd(0x77, 0);  // CMD55
-        response = sd_send_cmd(0x69, 0x40000000);  // ACMD41
-        if (response == 0x00) break;
+    if (response == 0x01) {
+        // SDHC/SDXC карта - четем R7 отговор (докато CS е ниско)
+        uint8_t r7[4];
+        for (int i = 0; i < 4; i++) {
+            spi_read_blocking(SPI_PORT, 0xFF, &r7[i], 1);
+        }
+        gpio_put(PIN_CS, 1);
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        
+        // Проверка дали картата поддържа напрежението
+        if (r7[2] == 0x01 && r7[3] == 0xAA) {
+            is_sdhc = true;
+        }
+    } else if (response == 0x05) {
+        // Стара SD карта (SDSC) - не поддържа CMD8
+        gpio_put(PIN_CS, 1);
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        is_sdhc = false;
+    } else {
+        gpio_put(PIN_CS, 1);
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        printf("SD CMD8 unexpected response: 0x%02X\n", response);
+        // Продължаваме с опит за инициализация (предполагаме SDSC)
+        is_sdhc = false;
+    }
+    
+    // ACMD41 - Initialize (SD_SEND_OP_COND)
+    // За SDHC/SDXC използваме 0x40000000, за SDSC използваме 0x00000000
+    uint32_t acmd41_arg = is_sdhc ? 0x40000000 : 0x00000000;
+    
+    for (int i = 0; i < 200; i++) {  // Увеличено от 100 до 200 опита
+        // CMD55 - APP_CMD (задължително преди всяка ACMD команда)
+        response = sd_send_cmd(0x77, 0);
+        if (response != 0x01) {
+            // Ако CMD55 не връща 0x01, картата не е готова
+            sleep_ms(10);
+            continue;
+        }
+        
+        // Допълнителни clock цикли между CMD55 и ACMD41
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        
+        // ACMD41 - Initialize
+        response = sd_send_cmd(0x69, acmd41_arg);
+        if (response == 0x00) {
+            // Успешна инициализация
+            break;
+        }
+        
+        // Ако получим 0x01, картата все още е в idle state - продължаваме
+        if (response != 0x01) {
+            printf("SD ACMD41 unexpected response: 0x%02X (attempt %d)\n", response, i + 1);
+        }
+        
         sleep_ms(10);
     }
     
     if (response != 0x00) {
-        printf("SD ACMD41 failed: 0x%02X\n", response);
+        printf("SD ACMD41 failed: 0x%02X (after 200 attempts)\n", response);
         return false;
     }
     
     // Увеличаване на скоростта
     spi_set_baudrate(SPI_PORT, 10000000);  // 10 MHz
     
-    printf("SD карта инициализирана успешно\n");
+    printf("SD карта инициализирана успешно (%s)\n", is_sdhc ? "SDHC/SDXC" : "SDSC");
     return true;
 }
 
@@ -307,11 +401,16 @@ static bool handle_sd_card_insertion(void) {
         return false;
     }
     
+    printf("Файловата система е монтирана успешно\n");
+    
+    // Кратко забавяне за да се стабилизира файловата система
+    sleep_ms(50);
+    
     // Инициализация на disk manager
     disk_manager_init(&disk_manager);
     
-    // Сканиране за дискови имиджи
-    if (!disk_manager_scan(&disk_manager)) {
+    // Рекурсивно сканиране за дискови имиджи (включително поддиректории)
+    if (!disk_manager_scan_recursive(&disk_manager, "")) {
         printf("ПРЕДУПРЕЖДЕНИЕ: Не са намерени .dsk файлове\n");
         // Картата е налична, но няма дискови имиджи
         sd_card_present = true;
@@ -946,7 +1045,49 @@ static void update_display(void) {
     
     ssd1306_clear();
     
-    if (ui_mode == UI_MODE_DISK_SELECT) {
+    if (ui_mode == UI_MODE_DIR_NAV) {
+        // Меню за навигация в директории
+        const char *current_path = disk_manager_get_current_path(&disk_manager);
+        
+        // Заглавие с текущия път
+        if (strlen(current_path) == 0) {
+            snprintf(buffer, sizeof(buffer), "Dir: / (%d)", dir_item_count);
+        } else {
+            // Съкращаване на пътя ако е твърде дълъг
+            char short_path[15];
+            if (strlen(current_path) > 14) {
+                snprintf(short_path, sizeof(short_path), "...%s", current_path + strlen(current_path) - 11);
+            } else {
+                strncpy(short_path, current_path, sizeof(short_path) - 1);
+                short_path[sizeof(short_path) - 1] = '\0';
+            }
+            snprintf(buffer, sizeof(buffer), "Dir: %s", short_path);
+        }
+        ssd1306_draw_string(0, 0, buffer);
+        
+        // Показване на до 4 елемента на страница
+        uint8_t items_per_page = 4;
+        uint8_t start_idx = dir_menu_start;
+        uint8_t end_idx = (start_idx + items_per_page < dir_item_count) ? 
+                          (start_idx + items_per_page) : dir_item_count;
+        
+        for (uint8_t i = start_idx; i < end_idx; i++) {
+            uint8_t y_pos = 10 + (i - start_idx) * 12;
+            const char *marker = (i == dir_menu_selection) ? ">" : " ";
+            const char *dir_marker = dir_item_is_dir[i] ? "[DIR]" : "     ";
+            
+            // Съкращаване на името ако е твърде дълго
+            char short_name[10];
+            strncpy(short_name, dir_items[i], 9);
+            short_name[9] = '\0';
+            
+            snprintf(buffer, sizeof(buffer), "%s%s%.9s", marker, dir_marker, short_name);
+            ssd1306_draw_string(0, y_pos, buffer);
+        }
+        
+        // Инструкции
+        ssd1306_draw_string(0, 58, "Btn:Open  Rot:Nav");
+    } else if (ui_mode == UI_MODE_DISK_SELECT) {
         // Меню за избор на диск
         uint8_t disk_count = disk_manager_get_count(&disk_manager);
         
@@ -1039,7 +1180,153 @@ static void update_display(void) {
 static void handle_ui_input(void) {
     int8_t encoder_delta = encoder_read(&encoder);
     
-    if (ui_mode == UI_MODE_DISK_SELECT) {
+    if (ui_mode == UI_MODE_DIR_NAV) {
+        // Режим за навигация в директории
+        if (encoder_delta > 0) {
+            // Навигация надолу
+            if (dir_menu_selection < dir_item_count - 1) {
+                dir_menu_selection++;
+                // Скролване на страницата ако е необходимо
+                uint8_t items_per_page = 4;
+                if (dir_menu_selection >= dir_menu_start + items_per_page) {
+                    dir_menu_start = dir_menu_selection - items_per_page + 1;
+                }
+            }
+            update_display();
+        } else if (encoder_delta < 0) {
+            // Навигация нагоре
+            if (dir_menu_selection > 0) {
+                dir_menu_selection--;
+                // Скролване на страницата ако е необходимо
+                if (dir_menu_selection < dir_menu_start) {
+                    dir_menu_start = dir_menu_selection;
+                }
+            }
+            update_display();
+        }
+        
+        if (encoder_button_pressed(&encoder)) {
+            // Проверка за двойно натискане (изход от режима)
+            uint32_t current_time = to_ms_since_boot(get_absolute_time());
+            if (current_time - last_button_press < 500 && last_button_press > 0) {
+                // Двойно натискане - изход от режима на навигация
+                ui_mode = UI_MODE_NORMAL;
+                update_display();
+                last_button_press = 0;
+                return;
+            }
+            last_button_press = current_time;
+            
+            // Отваряне на избрания елемент
+            if (dir_menu_selection < dir_item_count) {
+                const char *current_path = disk_manager_get_current_path(&disk_manager);
+                char new_path[MAX_PATH_LEN];
+                
+                if (dir_item_is_dir[dir_menu_selection]) {
+                    // Проверка за връщане назад
+                    if (strcmp(dir_items[dir_menu_selection], "..") == 0) {
+                        // Връщане към родителската директория
+                        if (strlen(current_path) > 0) {
+                            // Намиране на последния "/"
+                            char *last_slash = strrchr(current_path, '/');
+                            if (last_slash != NULL) {
+                                *last_slash = '\0';
+                                strncpy(new_path, current_path, MAX_PATH_LEN - 1);
+                                new_path[MAX_PATH_LEN - 1] = '\0';
+                            } else {
+                                new_path[0] = '\0';  // Връщане към корневата директория
+                            }
+                        } else {
+                            new_path[0] = '\0';  // Вече сме в корневата директория
+                        }
+                    } else {
+                        // Отваряне на поддиректория
+                        if (strlen(current_path) == 0) {
+                            snprintf(new_path, MAX_PATH_LEN, "%s", dir_items[dir_menu_selection]);
+                        } else {
+                            snprintf(new_path, MAX_PATH_LEN, "%s/%s", current_path, dir_items[dir_menu_selection]);
+                        }
+                    }
+                    disk_manager_set_path(&disk_manager, new_path);
+                    // Зареждане на елементите в новата директория
+                    disk_manager_list_directory(&disk_manager, new_path, dir_items, dir_item_is_dir, 
+                                                &dir_item_count, 20);
+                    dir_menu_selection = 0;
+                    dir_menu_start = 0;
+                } else {
+                    // Зареждане на .dsk файл
+                    char file_path[MAX_PATH_LEN];
+                    if (strlen(current_path) == 0) {
+                        snprintf(file_path, MAX_PATH_LEN, "%s", dir_items[dir_menu_selection]);
+                    } else {
+                        snprintf(file_path, MAX_PATH_LEN, "%s/%s", current_path, dir_items[dir_menu_selection]);
+                    }
+                    
+                    // Проверка дали е .dsk файл
+                    size_t len = strlen(file_path);
+                    if (len >= 4) {
+                        const char *ext = file_path + len - 4;
+                        bool is_dsk = (ext[0] == '.' && 
+                                      (ext[1] == 'd' || ext[1] == 'D') &&
+                                      (ext[2] == 's' || ext[2] == 'S') &&
+                                      (ext[3] == 'k' || ext[3] == 'K'));
+                        
+                        if (is_dsk) {
+                            // Зареждане на файла
+                            FIL file;
+                            FRESULT res = f_open(&file, file_path, FA_READ);
+                            if (res == FR_OK) {
+                                // Намиране на файла в списъка или добавяне
+                                bool found = false;
+                                uint8_t file_index = 0;
+                                for (uint8_t i = 0; i < disk_manager.count; i++) {
+                                    if (strcmp(disk_manager.images[i].filename, file_path) == 0) {
+                                        found = true;
+                                        file_index = i;
+                                        break;
+                                    }
+                                }
+                                
+                                if (!found && disk_manager.count < MAX_DISK_IMAGES) {
+                                    // Добавяне на нов файл
+                                    file_index = disk_manager.count;
+                                    strncpy(disk_manager.images[file_index].filename, file_path, MAX_FILENAME_LEN - 1);
+                                    disk_manager.images[file_index].filename[MAX_FILENAME_LEN - 1] = '\0';
+                                    
+                                    // Получаване на размера на файла
+                                    // Запазване на текущата позиция
+                                    FSIZE_t current_pos = f_tell(&file);
+                                    // Отиване в края на файла
+                                    f_lseek(&file, 0xFFFFFFFF);  // Отиване в максимална позиция
+                                    FSIZE_t file_size = f_tell(&file);
+                                    // Връщане в началото
+                                    f_lseek(&file, 0);
+                                    
+                                    disk_manager.images[file_index].file_size = file_size;
+                                    disk_manager.images[file_index].format = DISK_FORMAT_AUTO;
+                                    disk_manager.images[file_index].loaded = false;
+                                    disk_manager.count++;
+                                }
+                                
+                                f_close(&file);
+                                
+                                // Зареждане на файла
+                                if (disk_manager_load(&disk_manager, file_index)) {
+                                    load_track(current_track);
+                                    printf("Зареден диск: %s\n", file_path);
+                                }
+                                
+                                // Връщане към нормален режим
+                                ui_mode = UI_MODE_NORMAL;
+                                update_display();
+                            }
+                        }
+                    }
+                }
+            }
+            update_display();
+        }
+    } else if (ui_mode == UI_MODE_DISK_SELECT) {
         // Режим за избор на диск
         uint8_t disk_count = disk_manager_get_count(&disk_manager);
         
@@ -1087,6 +1374,24 @@ static void handle_ui_input(void) {
         }
         
         if (encoder_button_pressed(&encoder)) {
+            // Проверка за двойно натискане (показване на списък с всички .dsk файлове)
+            uint32_t current_time = to_ms_since_boot(get_absolute_time());
+            if (current_time - last_button_press < 500 && last_button_press > 0 && menu_selection == 2) {
+                // Двойно натискане на "Disk" - показване на списък с всички .dsk файлове
+                ui_mode = UI_MODE_DISK_SELECT;
+                disk_menu_selection = disk_manager_get_current_index(&disk_manager);
+                uint8_t items_per_page = 4;
+                if (disk_menu_selection >= items_per_page) {
+                    disk_menu_start = disk_menu_selection - items_per_page + 1;
+                } else {
+                    disk_menu_start = 0;
+                }
+                update_display();
+                last_button_press = 0;
+                return;
+            }
+            last_button_press = current_time;
+            
             // Изпълнение на избраното действие
             switch (menu_selection) {
                 case 0:  // Toggle Motor
@@ -1099,17 +1404,15 @@ static void handle_ui_input(void) {
                     write_protected = !write_protected;
                     gpio_put(GPIO_WRITE_PROTECT, write_protected ? 0 : 1);
                     break;
-                case 2:  // Select Disk
-                    // Превключване към режим за избор на диск
-                    ui_mode = UI_MODE_DISK_SELECT;
-                    disk_menu_selection = disk_manager_get_current_index(&disk_manager);
-                    // Скролване до текущия диск
-                    uint8_t items_per_page = 4;
-                    if (disk_menu_selection >= items_per_page) {
-                        disk_menu_start = disk_menu_selection - items_per_page + 1;
-                    } else {
-                        disk_menu_start = 0;
-                    }
+                case 2:  // Select Disk / Navigate
+                    // Превключване към режим за навигация в директории
+                    ui_mode = UI_MODE_DIR_NAV;
+                    disk_manager_set_path(&disk_manager, "");
+                    // Зареждане на елементите в корневата директория
+                    disk_manager_list_directory(&disk_manager, "", dir_items, dir_item_is_dir, 
+                                                &dir_item_count, 20);
+                    dir_menu_selection = 0;
+                    dir_menu_start = 0;
                     update_display();
                     break;
             }
