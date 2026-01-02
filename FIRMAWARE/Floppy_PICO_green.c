@@ -1140,7 +1140,7 @@ int main(void) {
     stdio_init_all();
     
     printf("\n=== Apple II Floppy Disk Emulator ===\n");
-    printf("Версия: 1.0\n");
+    printf("Версия: 1.1\n");
     printf("16 сектора на пътека\n\n");
     
     // Зареждане на конфигурация по подразбиране
