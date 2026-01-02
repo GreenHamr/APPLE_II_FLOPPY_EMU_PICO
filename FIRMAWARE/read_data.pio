@@ -1,0 +1,43 @@
+; PIO програма за генериране на READ_DATA сигнал за Apple II
+; Генерира данни с точно времеване (125 kHz = 8 микросекунди на бит)
+
+.program read_data
+
+; Очаква данни в FIFO
+; Изпраща битове последователно на READ_DATA пин с точно времеване
+
+start:
+    pull        ; Извличане на данни от FIFO в OSR
+    set x, 7    ; Брояч за 8 бита (0-7)
+    
+bit_loop:
+    out pins, 1 ; Изпращане на 1 бит (MSB first заради autopull настройката)
+    jmp x-- bit_loop  ; Декрементиране и повторение
+    
+    ; Следващия байт
+    jmp start
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void read_data_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = read_data_program_get_default_config(offset);
+    
+    // Настройка на изходен пин
+    sm_config_set_set_pins(&c, pin, 1);
+    
+    // Настройка на clock divider за 125 kHz
+    // Системен clock / 125000 = divider
+    float div = (float)clock_get_hz(clk_sys) / 125000.0f;
+    sm_config_set_clkdiv(&c, div);
+    
+    // Настройка на FIFO
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
+    sm_config_set_out_shift(&c, true, true, 8);  // MSB first, autopull
+    
+    // Инициализация
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+

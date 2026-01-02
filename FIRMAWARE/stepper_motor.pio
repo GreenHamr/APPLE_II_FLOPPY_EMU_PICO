@@ -1,0 +1,72 @@
+; PIO програма за управление на 4-фазен стъпков мотор
+; За Apple II флопи диск контролер
+
+.program stepper_motor
+
+; Очаква стойност в OSR за фаза (0-3)
+; Генерира 4-фазен сигнал на изходите
+
+start:
+    pull        ; Извличане на фазова стойност
+    mov x, osr  ; Запазване в X регистъра
+    
+    ; Генериране на фаза 0
+    jmp !x phase0
+    jmp check_phase1
+    
+phase0:
+    set pins, 0b0001  ; PH0 = 1, останалите = 0
+    jmp done
+    
+check_phase1:
+    mov y, x
+    jmp y-- phase1_check
+    jmp check_phase2
+    
+phase1_check:
+    jmp !y phase1
+    jmp check_phase2
+    
+phase1:
+    set pins, 0b0010  ; PH1 = 1
+    jmp done
+    
+check_phase2:
+    mov y, x
+    sub y, 2
+    jmp !y phase2
+    jmp phase3
+    
+phase2:
+    set pins, 0b0100  ; PH2 = 1
+    jmp done
+    
+phase3:
+    set pins, 0b1000  ; PH3 = 1
+    
+done:
+    ; Забавяне преди следващата стъпка
+    mov y, 30
+delay_loop:
+    jmp y-- delay_loop
+    jmp start
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void stepper_motor_program_init(PIO pio, uint sm, uint offset, uint pin_base) {
+    pio_sm_config c = stepper_motor_program_get_default_config(offset);
+    
+    // Настройка на изходни пинове
+    sm_config_set_set_pins(&c, pin_base, 4);
+    
+    // Настройка на clock divider
+    float div = (float)clock_get_hz(clk_sys) / (1000000);  // 1 MHz
+    sm_config_set_clkdiv(&c, div);
+    
+    // Инициализация
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+

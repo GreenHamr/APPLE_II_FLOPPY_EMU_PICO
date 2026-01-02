@@ -1,0 +1,44 @@
+; PIO програма за улавяне на WRITE_DATA сигнал от Apple II
+; Улавя битове с точно времеване (125 kHz = 8 микросекунди на бит)
+
+.program write_data
+
+; Чете битове от WRITE_DATA пин и ги записва в FIFO
+; Използва autopush за автоматично изпращане на 8 бита
+
+start:
+    wait 1 pin 0    ; Чакане за високо ниво (rising edge)
+    in pins, 1      ; Четене на бит от пин
+    wait 0 pin 0    ; Чакане за ниско ниво (falling edge)
+    
+    ; С autopush на 8 бита, данните автоматично се изпращат в FIFO
+    ; когато се съберат 8 бита
+    jmp start
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void write_data_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = write_data_program_get_default_config(offset);
+    
+    // Настройка на входен пин
+    sm_config_set_in_pins(&c, pin);
+    
+    // Настройка на clock divider за 125 kHz
+    float div = (float)clock_get_hz(clk_sys) / 125000.0f;
+    sm_config_set_clkdiv(&c, div);
+    
+    // Настройка на FIFO
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_NONE);
+    sm_config_set_in_shift(&c, false, true, 8);  // LSB first, autopush
+    
+    // Настройка на pull (опционално)
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);  // Input
+    
+    // Инициализация
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
