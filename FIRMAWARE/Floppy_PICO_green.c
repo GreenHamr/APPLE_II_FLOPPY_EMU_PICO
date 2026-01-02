@@ -409,8 +409,18 @@ static bool handle_sd_card_insertion(void) {
     // Инициализация на disk manager
     disk_manager_init(&disk_manager);
     
+    // Намаляване на скоростта на SPI за по-стабилно сканиране
+    spi_set_baudrate(SPI_PORT, 2000000);  // 2 MHz за сканиране (по-стабилно)
+    printf("Скоростта на SPI е намалена до 2 MHz за сканиране\n");
+    
     // Рекурсивно сканиране за дискови имиджи (включително поддиректории)
-    if (!disk_manager_scan_recursive(&disk_manager, "")) {
+    bool scan_result = disk_manager_scan_recursive(&disk_manager, "");
+    
+    // Възстановяване на нормалната скорост
+    spi_set_baudrate(SPI_PORT, 10000000);  // 10 MHz за нормална работа
+    printf("Скоростта на SPI е възстановена до 10 MHz\n");
+    
+    if (!scan_result) {
         printf("ПРЕДУПРЕЖДЕНИЕ: Не са намерени .dsk файлове\n");
         // Картата е налична, но няма дискови имиджи
         sd_card_present = true;
