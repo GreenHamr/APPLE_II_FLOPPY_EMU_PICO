@@ -624,23 +624,15 @@ bool sd_read_block(uint32_t block_addr, uint8_t *buffer) {
         if (response != 0x00) {
             gpio_put(PIN_CS, 1);
             spi_write_blocking(SPI_PORT, &dummy, 1);
-            if (retry == 0) {  // Показваме debug само при първия опит
-                printf("DEBUG sd_read_block: CMD17 отговор FAILED: 0x%02X за блок %lu (адрес: %lu, SDHC: %d)\n", 
-                       response, (unsigned long)block_addr, (unsigned long)address, sd_is_sdhc);
-                printf("DEBUG sd_read_block: Първите 8 байта отговора: ");
-                for (int i = 0; i < 8; i++) {
-                    printf("%02X ", response_bytes[i]);
-                }
-                printf("\n");
-                fflush(stdout);
-            }
             // Ако отговорът не е 0x00, това е грешка - валидни отговори са само 0x00 (успех) или 0x01-0x7F (грешка)
-            // 0x3F не е валиден отговор - може да означава че сме прочели данни вместо отговор
             // Опитваме се да направим повторен опит с по-дълго изчакване
             if (retry < 2) {
                 sleep_ms(10);  // Кратко изчакване преди повторен опит
                 continue;
             }
+            // Ако и всички опити са неуспешни, връщаме грешка
+            printf("ERROR sd_read_block: CMD17 FAILED след 3 опита: 0x%02X за блок %lu\n", 
+                   response, (unsigned long)block_addr);
             return false;
         }
         

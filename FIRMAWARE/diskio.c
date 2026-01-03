@@ -108,7 +108,6 @@ DRESULT disk_read (
 	for (UINT i = 0; i < count; i++) {
 		LBA_t current_sector = sector + i;
 		if (!sd_read_block(current_sector, buff + (i * 512))) {
-			printf("DEBUG disk_read: sd_read_block FAILED за сектор %lu\n", (unsigned long)current_sector);
 			return RES_ERROR;
 		}
 	}

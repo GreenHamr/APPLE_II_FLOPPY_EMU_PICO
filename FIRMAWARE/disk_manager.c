@@ -275,11 +275,8 @@ bool disk_manager_scan(disk_manager_t *dm) {
 
 bool disk_manager_load(disk_manager_t *dm, uint8_t index) {
     if (index >= dm->count) {
-        printf("DEBUG disk_manager_load: index %d >= count %d\n", index, dm->count);
         return false;
     }
-    
-    printf("DEBUG disk_manager_load: Опит за зареждане на диск %d: %s\n", index, dm->images[index].filename);
     
     // Затваряне на текущия файл ако е отворен
     if (dm->disk_loaded && dm->images[dm->current_index].loaded) {
@@ -291,13 +288,9 @@ bool disk_manager_load(disk_manager_t *dm, uint8_t index) {
     FRESULT res = f_open(&dm->images[index].file_handle, 
                         dm->images[index].filename, 
                         FA_READ | FA_WRITE);
-    printf("DEBUG disk_manager_load: f_open res %d FR_OK %d\n", res, FR_OK);
     if (res != FR_OK) {
-        printf("DEBUG disk_manager_load: f_open FAILED с код %d за файл: %s\n", res, dm->images[index].filename);
         return false;
     }
-    
-    printf("DEBUG disk_manager_load: f_open успешен за файл: %s\n", dm->images[index].filename);
     
     // Автоматично определяне на формат
     uint32_t file_size = dm->images[index].file_size;
