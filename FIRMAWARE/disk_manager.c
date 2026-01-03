@@ -4,6 +4,7 @@
 
 #include "disk_manager.h"
 #include "ff.h"
+#include "cli.h"
 #include <string.h>
 #include <stdio.h>
 #include "pico/time.h"
@@ -49,7 +50,14 @@ bool disk_manager_scan(disk_manager_t *dm) {
     
     printf("=== Сканиране за .dsk файлове (само корнева директория) ===\n");
     printf("Започване на сканиране...\n");
-    printf("ВНИМАНИЕ: Ако виждате FR_NO_FILE веднага, може да има проблем с FatFS имплементацията\n");
+    
+    // Проверка дали използваме правилната версия на FatFS
+    #ifdef FF_DEFINED
+    printf("FatFS версия: FF_DEFINED = %d (пълна версия)\n", FF_DEFINED);
+    #else
+    printf("ВНИМАНИЕ: FF_DEFINED не е дефиниран - използва се опростена версия!\n");
+    printf("  За пълна функционалност, уверете се че fatfs/ff.c се компилира!\n");
+    #endif
     
     // Забавяне преди започване на сканиране за стабилност
     sleep_ms(50);
@@ -137,14 +145,37 @@ bool disk_manager_scan(disk_manager_t *dm) {
     // Забавяне преди започване на четене
     sleep_ms(10);
     
+    // Инициализация на FILINFO структурата
+    memset(&fno, 0, sizeof(fno));
+    
     // Търсене на .dsk файлове
     while (count < MAX_DISK_IMAGES) {
+        // Забавяне между четенията за стабилност
+        sleep_ms(5);
+        
         res = f_readdir(&dir, &fno);
+        printf("f_readdir[%d]: код=%d", total_files + 1, res);
         
         // Проверка за грешка или край на директорията
-        if (res != FR_OK || fno.fname[0] == 0) {
+        if (res != FR_OK) {
+            printf(" - ГРЕШКА\n");
+            if (res == FR_NO_FILE) {
+                printf("  FR_NO_FILE - край на директорията или празна директория\n");
+                printf("  Прочетени общо %d елемента преди края\n", total_files);
+            } else {
+                printf("  Други грешки: код %d\n", res);
+            }
             break;
         }
+        
+        if (fno.fname[0] == 0) {
+            printf(" - празно име (край на директорията)\n");
+            printf("  Прочетени общо %d елемента\n", total_files);
+            break;
+        }
+        
+        printf(", файл: '%s', размер: %lu, атрибути: 0x%02X\n", 
+               fno.fname, (unsigned long)fno.fsize, fno.fattrib);
         
         total_files++;
         
@@ -338,24 +369,44 @@ static void scan_directory_recursive(disk_manager_t *dm, const char *path, uint8
     sleep_ms(10);
     
     // Четене на всички елементи в директорията
-    while (*count < MAX_DISK_IMAGES) {
+    // Защита срещу безкрайни цикли - максимум 1000 опита
+    uint16_t max_iterations = 1000;
+    uint16_t iteration_count = 0;
+    
+    while (*count < MAX_DISK_IMAGES && iteration_count < max_iterations) {
+        iteration_count++;
+        
         // Забавяне между четенията за стабилност
         sleep_ms(5);
         
+        // Обработка на CLI команди по време на сканиране
+        cli_process();
+        
         res = f_readdir(&dir, &fno);
+        printf("  f_readdir[%d]: код=%d", iteration_count, res);
+        
         if (res != FR_OK) {
-            printf("  f_readdir върна код: %d\n", res);
+            printf(" - ГРЕШКА\n");
             if (res == FR_NO_FILE) {
                 printf("  Край на директорията (FR_NO_FILE) - прочетени %d елемента\n", items_in_dir);
                 break;
             }
             // При други грешки опитваме се още веднъж с по-дълго забавяне
+            printf("  Опит за повторно четене след забавяне...\n");
             sleep_ms(20);
+            cli_process();  // CLI обработка по време на забавяне
             res = f_readdir(&dir, &fno);
+            printf("  Повторен опит: код=%d\n", res);
             if (res != FR_OK) {
+                if (res == FR_NO_FILE) {
+                    printf("  Край на директорията (FR_NO_FILE при повторен опит)\n");
+                    break;
+                }
                 printf("  Повторен опит също неуспешен (код: %d), спиране\n", res);
                 break;
             }
+        } else {
+            printf(", име: '%s'\n", fno.fname[0] ? fno.fname : "(празно)");
         }
         
         if (fno.fname[0] == 0) {
@@ -410,11 +461,27 @@ static void scan_directory_recursive(disk_manager_t *dm, const char *path, uint8
                     printf("    *** НАМЕРЕН .dsk ФАЙЛ: %s (размер: %lu байта) ***\n", 
                            full_path, (unsigned long)fno.fsize);
                     (*count)++;
+                    
+                    // CLI обработка след намиране на файл
+                    cli_process();
+                    
+                    // Проверка дали сме достигнали максимума
+                    if (*count >= MAX_DISK_IMAGES) {
+                        printf("  Достигнат е максималният брой дискови имиджи (%d), спиране на сканирането\n", MAX_DISK_IMAGES);
+                        break;
+                    }
                 }
             } else {
                 printf("    -> Пропуснат (името е твърде кратко)\n");
             }
         }
+        
+        // CLI обработка след обработка на всеки елемент
+        cli_process();
+    }
+    
+    if (iteration_count >= max_iterations) {
+        printf("  ПРЕДУПРЕЖДЕНИЕ: Достигнат е максималният брой итерации (%d), спиране на сканирането\n", max_iterations);
     }
     
     f_closedir(&dir);
@@ -431,12 +498,22 @@ bool disk_manager_scan_recursive(disk_manager_t *dm, const char *path) {
     printf("Път: %s\n", path ? path : "(root)");
     printf("========================================\n");
     
+    // CLI обработка преди сканиране
+    extern void cli_process(void);
+    cli_process();
+    
     scan_directory_recursive(dm, path ? path : "", &count);
+    
+    // CLI обработка след сканиране
+    cli_process();
     
     dm->count = count;
     printf("========================================\n");
     printf("=== РЕЗУЛТАТ: Намерени %d дискови имиджа (рекурсивно) ===\n", count);
     printf("========================================\n");
+    
+    // CLI обработка преди връщане
+    cli_process();
     
     return count > 0;
 }

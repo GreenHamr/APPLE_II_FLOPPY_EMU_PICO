@@ -7,21 +7,44 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static i2c_inst_t *i2c_instance = NULL;
 static uint8_t framebuffer[SSD1306_WIDTH * SSD1306_PAGES];
 
 static void ssd1306_write_command(uint8_t cmd) {
     uint8_t buf[2] = {0x00, cmd};  // Control byte + command
-    i2c_write_blocking(i2c_instance, SSD1306_I2C_ADDR, buf, 2, false);
+    // Използваме timeout вместо blocking за по-добър контрол
+    //printf("before whrite command\n");
+    i2c_write_timeout_us(i2c_instance, SSD1306_I2C_ADDR, buf, 2, false, 1000);
+    //printf("after whrite command\n");
+    // CLI обработка след командата за да не блокираме главния цикъл
+    //extern void cli_process(void);
+    //cli_process();
 }
 
 static void ssd1306_write_data(uint8_t *data, size_t len) {
-    uint8_t *buf = (uint8_t *)malloc(len + 1);
-    buf[0] = 0x40;  // Data mode
-    memcpy(buf + 1, data, len);
-    i2c_write_blocking(i2c_instance, SSD1306_I2C_ADDR, buf, len + 1, false);
-    free(buf);
+    // Разделяме изпращането на по-малки части за да не блокираме твърде дълго
+    const size_t chunk_size = 64;  // Изпращаме по 64 байта наведнъж (по-малко за по-бърза реакция)
+    size_t offset = 0;
+    
+    //extern void cli_process(void);
+    
+    while (offset < len) {
+        size_t current_chunk = (len - offset > chunk_size) ? chunk_size : (len - offset);
+        uint8_t *buf = (uint8_t *)malloc(current_chunk + 1);
+        buf[0] = 0x40;  // Data mode
+        memcpy(buf + 1, data + offset, current_chunk);
+        
+        // Използваме timeout вместо blocking за по-добър контрол
+        i2c_write_timeout_us(i2c_instance, SSD1306_I2C_ADDR, buf, current_chunk + 1, false, 2000);
+        
+        free(buf);
+        offset += current_chunk;
+        
+        // CLI обработка между частите за да не блокираме главния цикъл
+        //cli_process();
+    }
 }
 
 void ssd1306_init(i2c_inst_t *i2c, uint8_t sda, uint8_t scl) {
@@ -75,7 +98,6 @@ void ssd1306_update(void) {
     ssd1306_write_command(SSD1306_PAGEADDR);
     ssd1306_write_command(0);
     ssd1306_write_command(SSD1306_PAGES - 1);
-    
     ssd1306_write_data(framebuffer, sizeof(framebuffer));
 }
 

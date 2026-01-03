@@ -174,6 +174,39 @@ static const uint8_t gcr_decode_table[32] = {
 bool load_track(uint8_t track);
 bool sd_read_block(uint32_t block_addr, uint8_t *buffer);
 
+bool reserved_addr(uint8_t addr) {
+    return (addr & 0x78) == 0 || (addr & 0x78) == 0x78;
+}
+void ScanI2CBus0(i2c_inst_t *i2c, uint8_t sda, uint8_t scl) {
+    i2c_init(i2c, 400000);  // 400 kHz
+    gpio_set_function(sda, GPIO_FUNC_I2C);
+    gpio_set_function(scl, GPIO_FUNC_I2C);
+    gpio_pull_up(sda);
+    gpio_pull_up(scl);
+
+    printf("\nI2C 0 Bus Scan\n");
+    printf("   0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F\n");
+
+    for (int addr = 0; addr < (1 << 7); ++addr) {
+        if (addr % 16 == 0) {
+            printf("%02x ", addr);
+        }
+        // Skip over any reserved addresses.
+        int ret;
+        uint8_t rxdata;
+        i2c_read_timeout_us(i2c0,addr,&rxdata,1,false,1000);
+        if (reserved_addr(addr))
+            ret = PICO_ERROR_GENERIC;
+        else
+            ret = i2c_read_blocking(i2c0, addr, &rxdata, 1, false);
+            //ret = i2c_read_timeout_us(I2CMain,addr,&rxdata,1,false,1000);
+        printf(ret < 0 ? "." : "@");
+        printf(addr % 16 == 15 ? "\n" : "  ");
+    }
+    printf("Done.\n");
+
+}
+
 // Инициализация на SPI за SD карта
 static void sd_spi_init(void) {
     spi_init(SPI_PORT, 400000);  // 400 kHz за инициализация
@@ -254,23 +287,38 @@ bool sd_init(void) {
     gpio_put(PIN_CS, 1);
     
     // Първоначални clock цикли (минимум 74 за SD карта, но изпращаме повече за надеждност)
+    extern void cli_process(void);
     for (int i = 0; i < 100; i++) {
         spi_write_blocking(SPI_PORT, &dummy, 1);
+        // CLI/interrupt обработка на всеки 20-ти цикъл
+        if (i % 20 == 0) {
+            cli_process();
+        }
     }
     
     // Изчакване преди първата команда
     sleep_ms(10);
+    cli_process();  // Обработка на CLI команди
     
     // CMD0 - Reset (GO_IDLE_STATE)
     response = sd_send_cmd(0x40, 0);
     if (response != 0x01) {
         printf("SD CMD0 failed: 0x%02X\n", response);
         // Опитваме се още веднъж с по-дълго забавяне
-        sleep_ms(200);
+        // Разделяме забавянето на по-малки части за да обработваме CLI
+        for (int j = 0; j < 20; j++) {
+            sleep_ms(10);
+            cli_process();  // Обработка на CLI команди между забавянията
+        }
         for (int i = 0; i < 100; i++) {
             spi_write_blocking(SPI_PORT, &dummy, 1);
+            // CLI/interrupt обработка на всеки 20-ти цикъл
+            if (i % 20 == 0) {
+                cli_process();
+            }
         }
         sleep_ms(10);
+        cli_process();  // Обработка на CLI команди
         response = sd_send_cmd(0x40, 0);
         if (response != 0x01) {
             printf("SD CMD0 failed again: 0x%02X\n", response);
@@ -283,7 +331,11 @@ bool sd_init(void) {
     }
     
     // Изчакване след CMD0 (SD спецификация изисква минимум 1ms)
-    sleep_ms(50);  // Увеличено за по-надеждна инициализация
+    // Разделяме забавянето на по-малки части за да обработваме CLI
+    for (int i = 0; i < 5; i++) {
+        sleep_ms(10);
+        cli_process();  // Обработка на CLI команди между забавянията
+    }
     
     // CMD8 - Check voltage (SEND_IF_COND)
     // За CMD8 трябва да четем R7 отговора докато CS е ниско
@@ -336,6 +388,11 @@ bool sd_init(void) {
     
     // Опитваме се за по-дълго време за бавни карти
     for (int i = 0; i < 200; i++) {
+        // Обработка на CLI команди периодично по време на инициализация
+        if (i % 10 == 0) {
+            cli_process();  // Обработка на CLI команди на всеки 10-ти опит
+        }
+        
         // CMD55 - APP_CMD (задължително преди всяка ACMD команда)
         response = sd_send_cmd(0x77, 0);
         if (response != 0x01) {
@@ -344,7 +401,11 @@ bool sd_init(void) {
                 // Показваме само първите 10 опита или на всеки 20-ти опит
                 printf("SD CMD55 не готов: 0x%02X (attempt %d)\n", response, i + 1);
             }
-            sleep_ms(50);  // По-дълго изчакване при проблем с CMD55
+            // Разделяме забавянето на по-малки части за да обработваме CLI
+            for (int j = 0; j < 5; j++) {
+                sleep_ms(10);
+                cli_process();  // Обработка на CLI команди между забавянията
+            }
             continue;
         }
         
@@ -472,12 +533,15 @@ static void handle_sd_card_removal(void) {
 // Обработка на вмъкване на SD карта
 static bool handle_sd_card_insertion(void) {
     printf("Открита е SD карта, инициализиране...\n");
+    cli_process();  // Обработка на CLI команди по време на инициализация
     
     // Инициализация на SD карта
     if (!sd_init()) {
         printf("ГРЕШКА: Не може да се инициализира SD картата!\n");
+        cli_process();  // Обработка на CLI команди
         return false;
     }
+    cli_process();  // Обработка на CLI команди
     
     // Монтиране на файловата система
     FRESULT res = f_mount(&fs, "", 1);
@@ -489,27 +553,40 @@ static bool handle_sd_card_insertion(void) {
             printf("РЕШЕНИЕ: Форматирайте SD картата с FAT32 файлова система\n");
         }
         
+        cli_process();  // Обработка на CLI команди
         return false;
     }
     
     printf("Файловата система е монтирана успешно\n");
+    cli_process();  // Обработка на CLI команди
     
     // Кратко забавяне за да се стабилизира файловата система
-    sleep_ms(50);
+    // Разделяме забавянето на по-малки части за да обработваме CLI
+    for (int i = 0; i < 5; i++) {
+        sleep_ms(10);
+        cli_process();  // Обработка на CLI команди между забавянията
+    }
     
     // Инициализация на disk manager
     disk_manager_init(&disk_manager);
+    cli_process();  // Обработка на CLI команди
     
     // Намаляване на скоростта на SPI за по-стабилно сканиране
     spi_set_baudrate(SPI_PORT, 2000000);  // 2 MHz за сканиране (по-стабилно)
     printf("Скоростта на SPI е намалена до 2 MHz за сканиране\n");
+    cli_process();  // Обработка на CLI команди
     
     // Рекурсивно сканиране за дискови имиджи (включително поддиректории)
+    // Забележка: disk_manager_scan_recursive вече обработва CLI периодично
+    printf("Започване на рекурсивно сканиране...\n");
     bool scan_result = disk_manager_scan_recursive(&disk_manager, "");
+    printf("Сканирането завърши. Резултат: %s\n", scan_result ? "УСПЕХ" : "НЕУСПЕХ");
+    cli_process();  // Обработка на CLI команди след сканиране
     
     // Възстановяване на нормалната скорост
     spi_set_baudrate(SPI_PORT, 10000000);  // 10 MHz за нормална работа
     printf("Скоростта на SPI е възстановена до 10 MHz\n");
+    cli_process();  // Обработка на CLI команди
     
     if (!scan_result) {
         printf("ПРЕДУПРЕЖДЕНИЕ: Не са намерени .dsk файлове\n");
@@ -522,16 +599,25 @@ static bool handle_sd_card_insertion(void) {
     if (!disk_manager_load(&disk_manager, 0)) {
         printf("ПРЕДУПРЕЖДЕНИЕ: Не може да се зареди първият диск\n");
         sd_card_present = true;
+        cli_process();  // Обработка на CLI команди
         return true;
     }
+    cli_process();  // Обработка на CLI команди
     
     disk_image_loaded = true;
     sd_card_present = true;
     
     // Зареждане на текущата пътека
     load_track(current_track);
+    cli_process();  // Обработка на CLI команди
     
     printf("SD картата е готова за използване!\n");
+    
+    // Препроверка и реинициализация на interrupts след зареждане на файла
+    // (за да се уверяваме че interrupts все още работят след файлови операции)
+    extern void init_interrupts(void);
+    init_interrupts();
+    
     return true;
 }
 
@@ -603,7 +689,11 @@ bool sd_read_block(uint32_t block_addr, uint8_t *buffer) {
                 for (int i = 0; i < 10; i++) {
                     spi_write_blocking(SPI_PORT, &dummy, 1);
                 }
-                sleep_ms(50);
+                // Разделяме забавянето на по-малки части за да обработваме CLI/interrupts
+                for (int j = 0; j < 5; j++) {
+                    sleep_ms(10);
+                    cli_process();
+                }
                 continue;
             }
             // Опитваме се да направим повторен опит
@@ -625,6 +715,12 @@ bool sd_read_block(uint32_t block_addr, uint8_t *buffer) {
     for (int i = 0; i < 1000; i++) {
         spi_read_blocking(SPI_PORT, 0xFF, &token, 1);
         if (token == 0xFE) break;
+        
+        // CLI/interrupt обработка на всеки 100-ти опит за да не блокираме главния цикъл
+        if (i % 100 == 0) {
+            extern void cli_process(void);
+            cli_process();
+        }
     }
     
     if (token != 0xFE) {
@@ -635,8 +731,19 @@ bool sd_read_block(uint32_t block_addr, uint8_t *buffer) {
         return false;
     }
     
-    // Четене на 512 байта
-    spi_read_blocking(SPI_PORT, 0xFF, buffer, 512);
+    // Четене на 512 байта - разделяме на по-малки части за да обработваме CLI/interrupts
+    const size_t chunk_size = 64;  // Четем по 64 байта наведнъж
+    extern void cli_process(void);
+    
+    for (size_t offset = 0; offset < 512; offset += chunk_size) {
+        size_t current_chunk = (512 - offset > chunk_size) ? chunk_size : (512 - offset);
+        spi_read_blocking(SPI_PORT, 0xFF, buffer + offset, current_chunk);
+        
+        // CLI/interrupt обработка между частите
+        if (offset % (chunk_size * 2) == 0) {  // На всеки втори chunk
+            cli_process();
+        }
+    }
     
     // Четене на CRC (2 байта)
     spi_read_blocking(SPI_PORT, 0xFF, &dummy, 1);
@@ -701,8 +808,19 @@ bool sd_write_block(uint32_t block_addr, const uint8_t *buffer) {
     token = 0xFE;
     spi_write_blocking(SPI_PORT, &token, 1);
     
-    // Изпращане на 512 байта данни
-    spi_write_blocking(SPI_PORT, buffer, 512);
+    // Изпращане на 512 байта данни - разделяме на по-малки части за да обработваме CLI/interrupts
+    const size_t chunk_size = 64;  // Изпращаме по 64 байта наведнъж
+    extern void cli_process(void);
+    
+    for (size_t offset = 0; offset < 512; offset += chunk_size) {
+        size_t current_chunk = (512 - offset > chunk_size) ? chunk_size : (512 - offset);
+        spi_write_blocking(SPI_PORT, buffer + offset, current_chunk);
+        
+        // CLI/interrupt обработка между частите
+        if (offset % (chunk_size * 2) == 0) {  // На всеки втори chunk
+            cli_process();
+        }
+    }
     
     // Изпращане на CRC (2 байта dummy)
     spi_write_blocking(SPI_PORT, &dummy, 1);
@@ -712,6 +830,11 @@ bool sd_write_block(uint32_t block_addr, const uint8_t *buffer) {
     for (int i = 0; i < 100; i++) {
         spi_read_blocking(SPI_PORT, 0xFF, &token, 1);
         if ((token & 0x1F) == 0x05) break;  // Data accepted
+        
+        // CLI/interrupt обработка на всеки 20-ти опит
+        if (i % 20 == 0) {
+            cli_process();
+        }
     }
     
     if ((token & 0x1F) != 0x05) {
@@ -723,6 +846,11 @@ bool sd_write_block(uint32_t block_addr, const uint8_t *buffer) {
     for (int i = 0; i < 1000; i++) {
         spi_read_blocking(SPI_PORT, 0xFF, &token, 1);
         if (token != 0x00) break;
+        
+        // CLI/interrupt обработка на всеки 100-ти опит
+        if (i % 100 == 0) {
+            cli_process();
+        }
     }
     
     gpio_put(PIN_CS, 1);
@@ -736,32 +864,41 @@ static bool load_disk_image(void) {
     FRESULT res;
     
     printf("Монтиране на файловата система...\n");
+    cli_process();  // Обработка на CLI команди
     
     // Монтиране на файловата система
     res = f_mount(&fs, "", 1);
     if (res != FR_OK) {
         printf("ГРЕШКА: Не може да се монтира файловата система (код: %d)\n", res);
+        cli_process();  // Обработка на CLI команди
         return false;
     }
+    cli_process();  // Обработка на CLI команди
     
     // Инициализация на disk manager
     disk_manager_init(&disk_manager);
+    cli_process();  // Обработка на CLI команди
     
     // Сканиране за дискови имиджи
     if (!disk_manager_scan(&disk_manager)) {
         printf("ГРЕШКА: Не са намерени .dsk файлове\n");
+        cli_process();  // Обработка на CLI команди
         return false;
     }
+    cli_process();  // Обработка на CLI команди
     
     // Зареждане на първия диск
     if (!disk_manager_load(&disk_manager, 0)) {
         printf("ГРЕШКА: Не може да се зареди първият диск\n");
+        cli_process();  // Обработка на CLI команди
         return false;
     }
+    cli_process();  // Обработка на CLI команди
     
     disk_image_loaded = true;
     
     printf("Дисковият имидж е зареден успешно!\n");
+    cli_process();  // Обработка на CLI команди
     return true;
 }
 
@@ -791,8 +928,16 @@ bool load_track(uint8_t track) {
         return false;
     }
     
+    // CLI обработка преди четенето
+    extern void cli_process(void);
+    cli_process();
+    
     // Четене на пътеката
     res = f_read(&current_disk->file_handle, disk_image_buffer, track_size, &bytes_read);
+    
+    // CLI обработка след четенето
+    cli_process();
+    
     if (res != FR_OK || bytes_read != track_size) {
         printf("ГРЕШКА: Не може да се прочете пътека %d (код: %d, прочетено: %u)\n", 
                track, res, bytes_read);
@@ -1382,7 +1527,14 @@ static void update_display(void) {
         ssd1306_draw_string(90, 50, buffer);
     }
     
+    // CLI обработка преди блокиращата I2C операция
+//    cli_process();
+    printf("before update display\n");    
     ssd1306_update();
+    printf("after update display\n");    
+    
+    // CLI обработка след блокиращата I2C операция
+//    cli_process();
 }
 
 // Обработка на UI вход
@@ -1635,6 +1787,9 @@ static void init_ui(void) {
     // Инициализация на енкодер
     encoder_init(&encoder, ENCODER_PIN_A, ENCODER_PIN_B, ENCODER_BUTTON);
     
+
+    ScanI2CBus0(I2C_PORT, I2C_SDA, I2C_SCL);
+
     // Инициализация на OLED дисплей
     ssd1306_init(I2C_PORT, I2C_SDA, I2C_SCL);
     
@@ -1719,7 +1874,7 @@ int main(void) {
     init_ui();
     
     // Инициализация на CLI (UART0 на GPIO 0/1)
-    printf("Инициализация на CLI (UART0 на GPIO 0/1)...\n");
+    printf("Инициализация на CLI (UART1 на GPIO 4/5)...\n");
     cli_init();
     
 
@@ -1742,7 +1897,10 @@ int main(void) {
         sd_card_present = false;
     }
     
-
+    // Препроверка и реинициализация на interrupts след SD картата
+    // (за да се уверяваме че interrupts все още работят след SPI инициализация)
+    printf("Препроверка на interrupts след SD инициализация...\n");
+    init_interrupts();
     
     printf("Системата е готова!\n");
     gpio_put(LED_PIN, 1);
@@ -1753,6 +1911,10 @@ int main(void) {
     last_sd_check = time_us_32();
     
     while (1) {
+        // Обработка на CLI команди в началото на цикъла за по-добра реактивност
+        printf("cli PROCESS in main loop 1\n");
+        cli_process();
+        
         // Hotplug проверка на SD карта (на всеки 1 секунда)
         uint32_t current_time = time_us_32();
         if (current_time - last_sd_check > (SD_CHECK_INTERVAL_MS * 1000)) {
@@ -1842,16 +2004,19 @@ int main(void) {
         }
         
         // Обработка на CLI команди
+        printf("cli PROCESS in main loop 2\n");
         cli_process();
         
         // Обработка на UI вход
         handle_ui_input();
+        printf("cli PROCESS in main loop 4\n");
         
         // Обновяване на дисплея (на всеки 100ms)
         if (time_us_32() - last_display_update > 100000) {
             update_display();
             last_display_update = time_us_32();
         }
+        printf("cli PROCESS in main loop 5\n");
         
         // Мигане на LED за индикация (по-бавно когато моторът е изключен)
         static uint32_t led_toggle = 0;
@@ -1860,6 +2025,10 @@ int main(void) {
             gpio_put(LED_PIN, !gpio_get(LED_PIN));
             led_toggle = time_us_32();
         }
+        
+        // Обработка на CLI команди (допълнително извикване за по-добра реактивност)
+        printf("cli PROCESS in main loop 3\n");
+        cli_process();
         
         // Малка забавяне за намаляване на натоварването
         sleep_us(50);
