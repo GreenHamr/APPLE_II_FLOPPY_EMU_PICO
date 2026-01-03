@@ -93,6 +93,7 @@ bool disk_image_loaded = false;
 disk_manager_t disk_manager;  // Управление на множество дискови имиджи
 static FATFS fs;       // FatFS файлова система обект
 static bool sd_card_present = false;  // Статус на SD картата
+static bool sd_is_sdhc = false;      // Дали SD картата е SDHC/SDXC (true) или SDSC (false)
 static uint32_t last_sd_check = 0;   // Последна проверка за SD карта
 #define SD_CHECK_INTERVAL_MS 1000     // Проверка на всеки 1 секунда
 
@@ -171,6 +172,7 @@ static const uint8_t gcr_decode_table[32] = {
 
 // Forward декларации
 bool load_track(uint8_t track);
+bool sd_read_block(uint32_t block_addr, uint8_t *buffer);
 
 // Инициализация на SPI за SD карта
 static void sd_spi_init(void) {
@@ -243,11 +245,20 @@ bool sd_init(void) {
     response = sd_send_cmd(0x40, 0);
     if (response != 0x01) {
         printf("SD CMD0 failed: 0x%02X\n", response);
-        return false;
+        // Опитваме се още веднъж с по-дълго забавяне
+        sleep_ms(100);
+        for (int i = 0; i < 80; i++) {
+            spi_write_blocking(SPI_PORT, &dummy, 1);
+        }
+        response = sd_send_cmd(0x40, 0);
+        if (response != 0x01) {
+            printf("SD CMD0 failed again: 0x%02X\n", response);
+            return false;
+        }
     }
     
-    // Изчакване след CMD0
-    sleep_ms(10);
+    // Изчакване след CMD0 (SD спецификация изисква минимум 1ms)
+    sleep_ms(50);  // Увеличено за по-надеждна инициализация
     
     // CMD8 - Check voltage (SEND_IF_COND)
     // За CMD8 трябва да четем R7 отговора докато CS е ниско
@@ -298,17 +309,24 @@ bool sd_init(void) {
     // За SDHC/SDXC използваме 0x40000000, за SDSC използваме 0x00000000
     uint32_t acmd41_arg = is_sdhc ? 0x40000000 : 0x00000000;
     
-    for (int i = 0; i < 200; i++) {  // Увеличено от 100 до 200 опита
+    // Опитваме се за по-дълго време за бавни карти
+    for (int i = 0; i < 200; i++) {
         // CMD55 - APP_CMD (задължително преди всяка ACMD команда)
         response = sd_send_cmd(0x77, 0);
         if (response != 0x01) {
-            // Ако CMD55 не връща 0x01, картата не е готова
-            sleep_ms(10);
+            // Ако CMD55 не връща 0x01, картата не е готова - изчакваме по-дълго
+            if (i < 10 || (i % 20 == 0)) {
+                // Показваме само първите 10 опита или на всеки 20-ти опит
+                printf("SD CMD55 не готов: 0x%02X (attempt %d)\n", response, i + 1);
+            }
+            sleep_ms(50);  // По-дълго изчакване при проблем с CMD55
             continue;
         }
         
-        // Допълнителни clock цикли между CMD55 и ACMD41
-        spi_write_blocking(SPI_PORT, &dummy, 1);
+        // Допълнителни clock цикли между CMD55 и ACMD41 (SD спецификация изисква това)
+        for (int j = 0; j < 8; j++) {
+            spi_write_blocking(SPI_PORT, &dummy, 1);
+        }
         
         // ACMD41 - Initialize
         response = sd_send_cmd(0x69, acmd41_arg);
@@ -317,12 +335,34 @@ bool sd_init(void) {
             break;
         }
         
-        // Ако получим 0x01, картата все още е в idle state - продължаваме
-        if (response != 0x01) {
-            printf("SD ACMD41 unexpected response: 0x%02X (attempt %d)\n", response, i + 1);
+        // Ако получим 0x01, картата все още е в idle state - това е нормално, продължаваме
+        if (response == 0x01) {
+            // Нормално - картата все още се инициализира
+            // Продължаваме с нормалното изчакване
+        } else if ((response & 0x01) == 0x01) {
+            // Отговор с bit 0 set (idle state) но с други битове - може да е временен проблем
+            // Продължаваме но с по-дълго изчакване
+            if (i < 5) {
+                printf("SD ACMD41 response with idle bit: 0x%02X (attempt %d)\n", response, i + 1);
+            }
+            sleep_ms(50);
+            continue;
+        } else {
+            // Неочакван отговор без idle bit - може да е проблем, но опитваме се отново
+            if (i < 5) {
+                printf("SD ACMD41 unexpected response: 0x%02X (attempt %d)\n", response, i + 1);
+            }
+            // При неочакван отговор правим по-дълго изчакване и опитваме се отново с CMD0
+            sleep_ms(100);
+            // Опитваме се да направим reset с CMD0
+            uint8_t reset_response = sd_send_cmd(0x40, 0);
+            if (reset_response == 0x01) {
+                sleep_ms(50);
+            }
+            continue;
         }
         
-        sleep_ms(10);
+        sleep_ms(10);  // Нормално изчакване когато отговорът е 0x01
     }
     
     if (response != 0x00) {
@@ -333,8 +373,28 @@ bool sd_init(void) {
     // Увеличаване на скоростта
     spi_set_baudrate(SPI_PORT, 10000000);  // 10 MHz
     
+    // Запазване на типа на картата за използване в sd_read_block и sd_write_block
+    sd_is_sdhc = is_sdhc;
+    
     printf("SD карта инициализирана успешно (%s)\n", is_sdhc ? "SDHC/SDXC" : "SDSC");
     return true;
+}
+
+// Проверка дали SD картата е готова (публична функция за diskio.c)
+bool sd_check_ready(void) {
+    // Използваме CMD13 (SEND_STATUS) - безопасна команда която не променя състоянието
+    uint8_t response = sd_send_cmd(0x4D, 0);  // CMD13 - SEND_STATUS
+    if (response == 0x00) {
+        // Картата е готова - прочитаме статуса (2 байта) за да завършим транзакцията
+        uint8_t status[2];
+        uint8_t dummy = 0xFF;
+        gpio_put(PIN_CS, 0);
+        spi_read_blocking(SPI_PORT, 0xFF, status, 2);
+        gpio_put(PIN_CS, 1);
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        return true;
+    }
+    return false;
 }
 
 // Проверка дали SD картата е налична (hotplug detection)
@@ -396,8 +456,75 @@ static bool handle_sd_card_insertion(void) {
     
     // Монтиране на файловата система
     FRESULT res = f_mount(&fs, "", 1);
+    printf("DEBUG: (res: %d  , FR_OK)\n", res,FR_OK);
     if (res != FR_OK) {
         printf("ГРЕШКА: Не може да се монтира файловата система (код: %d)\n", res);
+        fflush(stdout);
+        printf("DEBUG: res = %d, FR_NO_FILESYSTEM = %d\n", res, (int)FR_NO_FILESYSTEM);
+        fflush(stdout);
+        
+        // Винаги опитваме се да прочетем сектор 0 за диагностика, независимо от кода на грешката
+        printf("DEBUG: Опитваме се да прочетем сектор 0 за диагностика...\n");
+        fflush(stdout);
+        uint8_t test_buffer[512];
+        bool read_ok = sd_read_block(0, test_buffer);
+        printf("DEBUG: Резултат от четене на сектор 0: %s\n", read_ok ? "УСПЕХ" : "ГРЕШКА");
+        fflush(stdout);
+        
+        // Винаги показваме debug информация за код 13 или FR_NO_FILESYSTEM
+        if (res == 13 || res == (int)FR_NO_FILESYSTEM) {
+            printf("DEBUG: Условието за код 13/FR_NO_FILESYSTEM е изпълнено\n");
+            fflush(stdout);
+            printf("  -> Няма валидна FAT файлова система на SD картата\n");
+            
+            if (read_ok) {
+                printf("  -> Сектор 0 прочетен успешно\n");
+                printf("  -> Първите 64 байта: ");
+                for (int i = 0; i < 64; i++) {
+                    printf("%02X ", test_buffer[i]);
+                    if ((i + 1) % 16 == 0) printf("\n  -> ");
+                }
+                printf("\n");
+                // Проверка за FAT32 подпис
+                if (test_buffer[0x1FE] == 0x55 && test_buffer[0x1FF] == 0xAA) {
+                    printf("  -> Boot signature OK (0xAA55)\n");
+                } else {
+                    printf("  -> Boot signature FAILED (0x%02X%02X, очаквано 0xAA55)\n", 
+                           test_buffer[0x1FF], test_buffer[0x1FE]);
+                }
+                // Проверка за FAT32 string
+                if (memcmp(&test_buffer[0x52], "FAT32   ", 8) == 0) {
+                    printf("  -> FAT32 string OK\n");
+                } else {
+                    printf("  -> FAT32 string NOT FOUND\n");
+                    printf("  -> На позиция 0x52: ");
+                    for (int i = 0; i < 8; i++) {
+                        printf("%c", (test_buffer[0x52 + i] >= 32 && test_buffer[0x52 + i] < 127) ? 
+                               test_buffer[0x52 + i] : '.');
+                    }
+                    printf("\n");
+                }
+                // Проверка за MBR partition table
+                printf("  -> MBR partition table (offset 0x1BE): ");
+                for (int i = 0; i < 16; i++) {
+                    printf("%02X ", test_buffer[0x1BE + i]);
+                }
+                printf("\n");
+            } else {
+                printf("  -> ГРЕШКА: Не може да се прочете сектор 0 от SD картата\n");
+                printf("  -> Възможни причини:\n");
+                printf("     1. Проблем с SPI комуникацията\n");
+                printf("     2. SD картата не е правилно инициализирана\n");
+                printf("     3. Проблем с адресирането (SDHC vs SDSC)\n");
+            }
+            printf("  -> Моля форматирайте SD картата с FAT32 (ако не е форматирана)\n");
+            fflush(stdout);
+        } else {
+            printf("  -> Други възможни причини:\n");
+            printf("     - SD картата не е инициализирана правилно\n");
+            printf("     - Проблем с четенето на данни\n");
+            fflush(stdout);
+        }
         return false;
     }
     
@@ -448,14 +575,77 @@ static bool handle_sd_card_insertion(void) {
 bool sd_read_block(uint32_t block_addr, uint8_t *buffer) {
     uint8_t response;
     uint8_t dummy = 0xFF;
+    uint32_t address;
+    uint8_t crc;
     
-    gpio_put(PIN_CS, 0);
+    // За SDHC/SDXC карти, адресът е директно в блокове
+    // За SDSC карти, адресът трябва да се умножи по 512 (размер на блока)
+    address = sd_is_sdhc ? block_addr : (block_addr * 512);
     
-    // CMD17 - Read single block
-    response = sd_send_cmd(0x51, block_addr);
-    if (response != 0x00) {
-        gpio_put(PIN_CS, 1);
-        return false;
+    // Опитваме се до 3 пъти при грешка
+    for (int retry = 0; retry < 3; retry++) {
+        gpio_put(PIN_CS, 0);
+        
+        // CMD17 - Read single block (изпращаме командата директно, без да използваме sd_send_cmd)
+        uint8_t cmd = 0x51;
+        crc = 0xFF;  // CRC disabled за SPI режим
+        
+        // Изпращане на команда
+        spi_write_blocking(SPI_PORT, &cmd, 1);
+        
+        // Изпращане на аргумент
+        uint8_t arg_bytes[4];
+        arg_bytes[0] = (address >> 24) & 0xFF;
+        arg_bytes[1] = (address >> 16) & 0xFF;
+        arg_bytes[2] = (address >> 8) & 0xFF;
+        arg_bytes[3] = address & 0xFF;
+        spi_write_blocking(SPI_PORT, arg_bytes, 4);
+        
+        // Изпращане на CRC
+        spi_write_blocking(SPI_PORT, &crc, 1);
+        
+        // Допълнителен dummy byte преди четенето на отговора (SD спецификация изисква минимум 1)
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        
+        // Четене на отговор (до 8 байта)
+        // Отговорът трябва да има бит 7 = 0 (0x00-0x7F), ако е 0xFF значи все още чака
+        response = 0xFF;
+        uint8_t response_bytes[8];
+        for (int i = 0; i < 8; i++) {
+            uint8_t read_byte;
+            spi_write_read_blocking(SPI_PORT, &dummy, &read_byte, 1);
+            response_bytes[i] = read_byte;
+            if ((read_byte & 0x80) == 0) {
+                response = read_byte;
+                break;
+            }
+        }
+        
+        if (response != 0x00) {
+            gpio_put(PIN_CS, 1);
+            spi_write_blocking(SPI_PORT, &dummy, 1);
+            if (retry == 0) {  // Показваме debug само при първия опит
+                printf("DEBUG sd_read_block: CMD17 отговор FAILED: 0x%02X за блок %lu (адрес: %lu, SDHC: %d)\n", 
+                       response, (unsigned long)block_addr, (unsigned long)address, sd_is_sdhc);
+                printf("DEBUG sd_read_block: Първите 8 байта отговора: ");
+                for (int i = 0; i < 8; i++) {
+                    printf("%02X ", response_bytes[i]);
+                }
+                printf("\n");
+                fflush(stdout);
+            }
+            // Ако отговорът не е 0x00, това е грешка - валидни отговори са само 0x00 (успех) или 0x01-0x7F (грешка)
+            // 0x3F не е валиден отговор - може да означава че сме прочели данни вместо отговор
+            // Опитваме се да направим повторен опит с по-дълго изчакване
+            if (retry < 2) {
+                sleep_ms(10);  // Кратко изчакване преди повторен опит
+                continue;
+            }
+            return false;
+        }
+        
+        // Успешен отговор - излизаме от retry цикъла
+        break;
     }
     
     // Чакане за старт токен (0xFE)
@@ -467,6 +657,9 @@ bool sd_read_block(uint32_t block_addr, uint8_t *buffer) {
     
     if (token != 0xFE) {
         gpio_put(PIN_CS, 1);
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        printf("DEBUG sd_read_block: Старт токен FAILED: 0x%02X (очаквано 0xFE) за блок %lu\n", 
+               token, (unsigned long)block_addr);
         return false;
     }
     
@@ -488,11 +681,45 @@ bool sd_write_block(uint32_t block_addr, const uint8_t *buffer) {
     uint8_t response;
     uint8_t dummy = 0xFF;
     uint8_t token;
+    uint32_t address;
+    uint8_t crc;
+    
+    // За SDHC/SDXC карти, адресът е директно в блокове
+    // За SDSC карти, адресът трябва да се умножи по 512 (размер на блока)
+    address = sd_is_sdhc ? block_addr : (block_addr * 512);
     
     gpio_put(PIN_CS, 0);
     
-    // CMD24 - Write single block
-    response = sd_send_cmd(0x58, block_addr);
+    // CMD24 - Write single block (изпращаме командата директно, без да използваме sd_send_cmd)
+    uint8_t cmd = 0x58;
+    crc = 0xFF;  // CRC disabled за SPI режим
+    
+    // Изпращане на команда
+    spi_write_blocking(SPI_PORT, &cmd, 1);
+    
+    // Изпращане на аргумент
+    uint8_t arg_bytes[4];
+    arg_bytes[0] = (address >> 24) & 0xFF;
+    arg_bytes[1] = (address >> 16) & 0xFF;
+    arg_bytes[2] = (address >> 8) & 0xFF;
+    arg_bytes[3] = address & 0xFF;
+    spi_write_blocking(SPI_PORT, arg_bytes, 4);
+    
+    // Изпращане на CRC
+    spi_write_blocking(SPI_PORT, &crc, 1);
+    
+    // Четене на отговор
+    response = 0xFF;
+    for (int i = 0; i < 8; i++) {
+        spi_read_blocking(SPI_PORT, 0xFF, &response, 1);
+        if ((response & 0x80) == 0) break;
+    }
+    
+    if (response != 0x00) {
+        gpio_put(PIN_CS, 1);
+        spi_write_blocking(SPI_PORT, &dummy, 1);
+        return false;
+    }
     if (response != 0x00) {
         gpio_put(PIN_CS, 1);
         return false;
@@ -1453,7 +1680,7 @@ int main(void) {
     stdio_init_all();
     
     printf("\n=== Apple II Floppy Disk Emulator ===\n");
-    printf("Версия: 1.1\n");
+    printf("Версия: 1.3\n");
     printf("16 сектора на пътека\n\n");
     
     // Зареждане на конфигурация по подразбиране

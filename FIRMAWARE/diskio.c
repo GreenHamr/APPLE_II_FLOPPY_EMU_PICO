@@ -22,6 +22,7 @@
 #include "ff.h"
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
+#include <stdio.h>
 
 // SD Card SPI pins (дефинирани в основния файл)
 extern spi_inst_t* SPI_PORT;
@@ -34,6 +35,7 @@ extern uint PIN_MOSI;
 extern bool sd_init(void);
 extern bool sd_read_block(uint32_t block_addr, uint8_t *buffer);
 extern bool sd_write_block(uint32_t block_addr, const uint8_t *buffer);
+extern bool sd_check_ready(void);
 
 static bool sd_initialized = false;
 
@@ -64,6 +66,18 @@ DSTATUS disk_initialize (
 {
 	if (pdrv != 0) return STA_NOINIT;
 	
+	// Ако картата вече е инициализирана, просто проверяваме дали е все още готова
+	if (sd_initialized) {
+		// Проверяваме дали картата все още отговаря с проста команда
+		if (sd_check_ready()) {
+			// Картата е готова
+			return 0;
+		}
+		// Ако проверката не работи, картата може да е загубена - маркираме като неинициализирана
+		sd_initialized = false;
+	}
+	
+	// Пълна инициализация
 	if (sd_init()) {
 		sd_initialized = true;
 		return 0;
@@ -84,10 +98,17 @@ DRESULT disk_read (
 )
 {
 	if (pdrv != 0) return RES_PARERR;
-	if (!sd_initialized) return RES_NOTRDY;
+	if (!sd_initialized) {
+		// Ако не е инициализирана, опитваме се да я инициализираме
+		if (disk_initialize(pdrv) & STA_NOINIT) {
+			return RES_NOTRDY;
+		}
+	}
 	
 	for (UINT i = 0; i < count; i++) {
-		if (!sd_read_block(sector + i, buff + (i * 512))) {
+		LBA_t current_sector = sector + i;
+		if (!sd_read_block(current_sector, buff + (i * 512))) {
+			printf("DEBUG disk_read: sd_read_block FAILED за сектор %lu\n", (unsigned long)current_sector);
 			return RES_ERROR;
 		}
 	}
