@@ -139,97 +139,31 @@ bool disk_manager_scan(disk_manager_t *dm) {
     
     // Търсене на .dsk файлове
     while (count < MAX_DISK_IMAGES) {
-        // Забавяне между четенията за стабилност
-        sleep_ms(5);
-        
         res = f_readdir(&dir, &fno);
-        printf("f_readdir резултат: код=%d", res);
-        if (res == FR_OK) {
-            printf(", име: '%s', размер: %lu\n", fno.fname, (unsigned long)fno.fsize);
-        } else {
-            printf("\n");
-        }
         
-        if (res != FR_OK) {
-            // FR_NO_FILE (4) може да означава край на директорията
-            if (res == FR_NO_FILE) {
-                // Проверка дали това е първото четене (директорията може да е празна)
-                if (total_files == 0) {
-                    printf("ВНИМАНИЕ: Директорията изглежда е празна или има проблем с четенето\n");
-                    printf("  Това може да означава:\n");
-                    printf("  1. Директорията наистина е празна\n");
-                    printf("  2. Проблем с FatFS имплементацията (опростена версия?)\n");
-                    printf("  3. Проблем с файловата система на SD картата\n");
-                    printf("  Опитваме се с по-дълго забавяне...\n");
-                    sleep_ms(100);
-                    res = f_readdir(&dir, &fno);
-                    if (res == FR_OK && fno.fname[0] != 0) {
-                        printf("  Повторен опит успешен! Продължаваме...\n");
-                        // Продължаваме с обработката на файла
-                    } else {
-                        printf("  Повторен опит също неуспешен (код: %d)\n", res);
-                        printf("  ВАЖНО: Проверете дали използвате ПЪЛНАТА FatFS библиотека, не опростената версия!\n");
-                        printf("  Директорията е празна или има проблем с файловата система\n");
-                        break;
-                    }
-                } else {
-                    printf("Край на директорията (FR_NO_FILE) - прочетени %d елемента\n", total_files);
-                    break;
-                }
-            } else {
-                printf("ГРЕШКА при четене на директория (код: %d)\n", res);
-                // При други грешки опитваме се още веднъж
-                sleep_ms(20);
-                res = f_readdir(&dir, &fno);
-                if (res == FR_OK && fno.fname[0] != 0) {
-                    printf("  Повторен опит успешен, продължаваме\n");
-                    // Продължаваме с обработката
-                } else {
-                    printf("  Повторен опит също неуспешен (код: %d), спиране\n", res);
-                    break;
-                }
-            }
-        }
-        
-        // Край на директорията (нормален случай)
-        if (fno.fname[0] == 0) {
-            printf("Край на директорията (празно име) - прочетени %d елемента\n", total_files);
+        // Проверка за грешка или край на директорията
+        if (res != FR_OK || fno.fname[0] == 0) {
             break;
         }
         
         total_files++;
-        printf("[%d] Намерен елемент: '%s' (атрибути: 0x%02X, размер: %lu)\n", 
-               total_files, fno.fname, fno.fattrib, (unsigned long)fno.fsize);
         
         // Пропускане на директории и скрити файлове
-        if (fno.fattrib & AM_DIR) {
-            printf("  -> Пропусната директория: %s\n", fno.fname);
-            continue;
-        }
-        
-        // Пропускане на скрити файлове
-        if (fno.fattrib & AM_HID) {
-            printf("  -> Пропуснат скрит файл: %s\n", fno.fname);
+        if (fno.fattrib & (AM_DIR | AM_HID)) {
             continue;
         }
         
         // Проверка за .dsk разширение (case-insensitive)
         size_t len = strlen(fno.fname);
-        printf("  -> Дължина на името: %zu\n", len);
         if (len < 4) {
-            printf("  -> Пропуснат файл (твърде кратко име): %s\n", fno.fname);
             continue;
         }
         
         const char *ext = fno.fname + len - 4;
-        printf("  -> Разширение: '%s'\n", ext);
-        // Проста case-insensitive проверка
         bool is_dsk = (ext[0] == '.' && 
                       (ext[1] == 'd' || ext[1] == 'D') &&
                       (ext[2] == 's' || ext[2] == 'S') &&
                       (ext[3] == 'k' || ext[3] == 'K'));
-        
-        printf("  -> Е .dsk файл: %s\n", is_dsk ? "ДА" : "НЕ");
         
         if (is_dsk) {
             // Проверка дали файлът вече не е добавен (от f_findfirst)
@@ -245,15 +179,13 @@ bool disk_manager_scan(disk_manager_t *dm) {
                 strncpy(dm->images[count].filename, fno.fname, MAX_FILENAME_LEN - 1);
                 dm->images[count].filename[MAX_FILENAME_LEN - 1] = '\0';
                 dm->images[count].file_size = fno.fsize;
-                dm->images[count].format = DISK_FORMAT_AUTO;  // Ще се определи автоматично
+                dm->images[count].format = DISK_FORMAT_AUTO;
                 dm->images[count].loaded = false;
                 printf("Намерен .dsk файл: %s (размер: %lu байта)\n", 
                        dm->images[count].filename, 
                        (unsigned long)dm->images[count].file_size);
                 count++;
             }
-        } else {
-            printf("Пропуснат файл (не е .dsk): %s\n", fno.fname);
         }
     }
     
